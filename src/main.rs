@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .enable_webtransport(true)
                         .enable_extended_connect(true)
                         .enable_datagram(true)
-                        .max_webtransport_sessions(u64::MAX)
+                        .max_webtransport_sessions((1_u64 << 62) - 1)
                         .send_grease(true)
                         .build(h3_quinn::Connection::new(conn))
                         .await
