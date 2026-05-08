@@ -1,10 +1,11 @@
 use std::fs::File;
 use std::io::BufReader;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use bytes::Bytes;
 use futures_util::StreamExt;
+use h3::ConnectionState;
 use h3::ext::Protocol;
 use h3_quinn::BidiStream;
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
@@ -18,7 +19,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpStream;
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 mod config;
 
@@ -165,6 +166,7 @@ pub async fn handle_connection(
                             && config.path.eq(path) =>
                     {
                         let headers = req.headers().to_owned();
+                        debug!("Connection settings: {:?}", h3_conn.settings());
                         let session = WebTransportSession::accept(req, stream, h3_conn).await?;
                         tracing::info!("Established webtransport session");
                         handle_webtransport_session(headers, session).await?;
