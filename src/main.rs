@@ -29,6 +29,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
+    let tcp_tls_config = tls_config.clone();
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = handle_tcp_ssl(config_clone, tcp_tls_config).await {
+            error!("Failed to handle SSL connections: {e:?}");
+        }
+    });
     tls_config.max_early_data_size = u32::MAX;
     let alpn: Vec<Vec<u8>> = vec![b"h3".to_vec()];
     tls_config.alpn_protocols = alpn;
@@ -78,6 +85,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     Ok(())
+}
+
+pub async fn handle_tcp_ssl(
+    config: Arc<config::Config>,
+    tls_config: rustls::ServerConfig,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(&config.listen).await?;
+    let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)));
+    let uri = config.upstream.parse::<http::Uri>()?;
+    let host = uri.host().context("Upstream URI must have a host")?;
+    let port = uri.port_u16().unwrap_or(80);
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        info!("new connection: {:?}", addr);
+        let acceptor = acceptor.clone();
+        let host = host.to_owned();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(mut stream) => {
+                    info!("new ssl established");
+                    let mut target_stream = match tokio::net::TcpStream::connect((host, port)).await
+                    {
+                        Ok(s) => s,
+                        Err(err) => {
+                            error!("Failed to connect to upstream: {:?}", err);
+                            return;
+                        }
+                    };
+                    if let Err(err) =
+                        tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
+                    {
+                        tracing::error!("Failed to handle connection: {err:?}");
+                    }
+                }
+                Err(err) => {
+                    error!("handshaking failed: {:?}", err);
+                }
+            }
+        });
+    }
 }
 
 pub async fn handle_connection(
