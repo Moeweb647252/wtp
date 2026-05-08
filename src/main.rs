@@ -269,16 +269,19 @@ pub async fn handle_webtransport_session(
             loop {
                 match session.accept_bi().await {
                     Ok(Some(AcceptedBi::BidiStream(_, mut stream))) => {
-                        let addr = endpoint.to_string();
+                        let endpoint = endpoint.to_owned();
                         tokio::spawn(async move {
-                            let mut target_stream = match TcpStream::connect(addr).await {
+                            let mut target_stream = match TcpStream::connect(&endpoint).await {
                                 Ok(s) => s,
                                 Err(err) => {
-                                    error!("Failed to connect to upstream: {:?}", err);
+                                    error!(
+                                        "Failed to connect to upstream addr: {} : {:?}",
+                                        endpoint, err
+                                    );
                                     return;
                                 }
                             };
-
+                            info!("Outgoing TCP connection established to {}", endpoint);
                             if let Err(e) =
                                 tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
                             {
@@ -298,10 +301,8 @@ pub async fn handle_webtransport_session(
         "udp" => {
             let mut tx = session.datagram_sender();
             let mut rx = session.datagram_reader();
-
-            let addr = endpoint.to_string();
             let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-            socket.connect(addr).await?;
+            socket.connect(endpoint).await?;
             let socket = Arc::new(socket);
             let socket_clone = socket.clone();
             let send_task = async move {
