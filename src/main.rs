@@ -211,6 +211,7 @@ pub async fn redirect_upstream(
 
     let (mut req_parts, _) = req.into_parts();
     req_parts.uri = upstream_uri.parse()?;
+    req_parts.version = http::Version::HTTP_11; // 强制使用 HTTP/1.1 或 HTTP/2，取决于 Client 的能力
 
     // 构造一个异步流来拉取 H3 数据
     let request_body_stream = futures_util::stream::unfold(rx, |mut s| async move {
