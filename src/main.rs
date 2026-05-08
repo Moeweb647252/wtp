@@ -16,7 +16,7 @@ use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::TcpSocket;
+use tokio::net::TcpStream;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 
@@ -266,21 +266,19 @@ pub async fn handle_webtransport_session(
         .to_str()?;
     match protocol {
         "tcp" => {
-            let addr: SocketAddr = endpoint.parse()?;
             loop {
                 match session.accept_bi().await {
                     Ok(Some(AcceptedBi::BidiStream(_, mut stream))) => {
+                        let addr = endpoint.to_string();
                         tokio::spawn(async move {
-                            let mut target_stream = match addr {
-                                SocketAddr::V4(_) => {
-                                    let socket = TcpSocket::new_v4().unwrap();
-                                    socket.connect(addr).await.unwrap()
-                                }
-                                SocketAddr::V6(_) => {
-                                    let socket = TcpSocket::new_v6().unwrap();
-                                    socket.connect(addr).await.unwrap()
+                            let mut target_stream = match TcpStream::connect(addr).await {
+                                Ok(s) => s,
+                                Err(err) => {
+                                    error!("Failed to connect to upstream: {:?}", err);
+                                    return;
                                 }
                             };
+
                             if let Err(e) =
                                 tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
                             {
@@ -301,11 +299,8 @@ pub async fn handle_webtransport_session(
             let mut tx = session.datagram_sender();
             let mut rx = session.datagram_reader();
 
-            let addr: SocketAddr = endpoint.parse()?;
-            let socket = match addr {
-                SocketAddr::V4(_) => tokio::net::UdpSocket::bind("0.0.0.0:0").await?,
-                SocketAddr::V6(_) => tokio::net::UdpSocket::bind("[::]:0").await?,
-            };
+            let addr = endpoint.to_string();
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
             socket.connect(addr).await?;
             let socket = Arc::new(socket);
             let socket_clone = socket.clone();
