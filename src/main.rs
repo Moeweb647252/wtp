@@ -12,8 +12,10 @@ use hyper::body::Frame;
 use hyper_util::client::legacy::Client;
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use quinn::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpSocket;
+use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 
 mod config;
@@ -21,11 +23,15 @@ mod config;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
     let config = Arc::new(config::load_config("config.toml").await?);
-    let cert = CertificateDer::from(tokio::fs::read(&config.cert).await?);
-    let key = PrivateKeyDer::try_from(tokio::fs::read(&config.key).await?)?;
+    let cert = CertificateDer::from_pem_file(&config.cert)?;
+    let key = PrivateKeyDer::from_pem_file(&config.key)?;
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
