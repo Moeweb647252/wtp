@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::BufReader;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
@@ -30,11 +32,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let config = Arc::new(config::load_config("config.toml").await?);
-    let cert = CertificateDer::from_pem_file(&config.cert)?;
+    let cert_file = File::open(&config.cert).context("Failed to open cert file")?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to parse certificates")?;
+
     let key = PrivateKeyDer::from_pem_file(&config.key)?;
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)?;
+        .with_single_cert(cert_chain, key)?;
     let tcp_tls_config = tls_config.clone();
     let config_clone = config.clone();
     tokio::spawn(async move {
@@ -43,7 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tls_config.max_early_data_size = u32::MAX;
-    let alpn: Vec<Vec<u8>> = vec![b"h3".to_vec()];
+    let alpn: Vec<Vec<u8>> = vec![
+        b"h3".to_vec(),
+        b"h3-32".to_vec(),
+        b"h3-31".to_vec(),
+        b"h3-30".to_vec(),
+        b"h3-29".to_vec(),
+    ];
     tls_config.alpn_protocols = alpn;
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
@@ -155,7 +168,13 @@ pub async fn handle_connection(
                         handle_webtransport_session(headers, session).await?;
                         return Ok(());
                     }
-                    _ => redirect_upstream(req, stream, config).await?,
+                    _ => {
+                        tokio::spawn(async move {
+                            if let Err(err) = redirect_upstream(req, stream, config).await {
+                                error!("Failed to redirect upstream: {err:?}");
+                            }
+                        });
+                    }
                 }
             }
             Ok(None) => {
@@ -244,26 +263,35 @@ pub async fn handle_webtransport_session(
         .to_str()?;
     match protocol {
         "tcp" => {
-            let accepted_bi = session
-                .accept_bi()
-                .await?
-                .context(format!("Corrupted proxy request {}", line!()))?;
-            match accepted_bi {
-                AcceptedBi::BidiStream(_, mut stream) => {
-                    let addr: SocketAddr = endpoint.parse()?;
-                    let mut target_stream = match addr {
-                        SocketAddr::V4(_) => {
-                            let socket = TcpSocket::new_v4()?;
-                            socket.connect(addr).await?
-                        }
-                        SocketAddr::V6(_) => {
-                            let socket = TcpSocket::new_v6()?;
-                            socket.connect(addr).await?
-                        }
-                    };
-                    tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await?;
+            let addr: SocketAddr = endpoint.parse()?;
+            loop {
+                match session.accept_bi().await {
+                    Ok(Some(AcceptedBi::BidiStream(_, mut stream))) => {
+                        tokio::spawn(async move {
+                            let mut target_stream = match addr {
+                                SocketAddr::V4(_) => {
+                                    let socket = TcpSocket::new_v4().unwrap();
+                                    socket.connect(addr).await.unwrap()
+                                }
+                                SocketAddr::V6(_) => {
+                                    let socket = TcpSocket::new_v6().unwrap();
+                                    socket.connect(addr).await.unwrap()
+                                }
+                            };
+                            if let Err(e) =
+                                tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
+                            {
+                                tracing::error!("TCP proxy stream error: {:?}", e);
+                            }
+                        });
+                    }
+                    Ok(None) => break, // Session 关闭
+                    Err(e) => {
+                        tracing::error!("Failed to accept bidi stream: {:?}", e);
+                        break;
+                    }
+                    _ => continue, // 处理其他类型的流或忽略
                 }
-                _ => anyhow::bail!("Corrupted proxy request {}", line!()),
             }
         }
         "udp" => {
