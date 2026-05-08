@@ -61,7 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
+    transport_config.datagram_receive_buffer_size(Some(65536));
+    transport_config.datagram_send_buffer_size(65536);
     server_config.transport = Arc::new(transport_config);
     let endpoint = quinn::Endpoint::server(server_config, config.listen.parse()?)?;
     info!("listening on {}", config.listen);
