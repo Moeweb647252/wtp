@@ -168,7 +168,20 @@ pub async fn handle_connection(
                             && config.path.eq(path) =>
                     {
                         let headers = req.headers().to_owned();
-                        debug!("Connection settings: {:?}", h3_conn.settings());
+                        if tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                if h3_conn.settings().enable_webtransport() {
+                                    break true;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .is_err()
+                        {
+                            error!("Client did not send settings frame within 5 seconds");
+                            return Ok(());
+                        }
                         let session = WebTransportSession::accept(req, stream, h3_conn).await?;
                         tracing::info!("Established webtransport session");
                         handle_webtransport_session(config, headers, session).await?;
