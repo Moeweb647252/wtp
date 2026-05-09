@@ -1,12 +1,14 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::task::Poll;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use fast_socks5::client::{Socks5Datagram, Socks5Stream};
 use futures_util::StreamExt;
+use futures_util::future::poll_fn;
 use h3::ConnectionState;
 use h3::ext::Protocol;
 use h3_quinn::BidiStream;
@@ -168,14 +170,18 @@ pub async fn handle_connection(
                             && config.path.eq(path) =>
                     {
                         let headers = req.headers().to_owned();
-                        if tokio::time::timeout(Duration::from_secs(5), async {
-                            loop {
+
+                        if tokio::time::timeout(
+                            Duration::from_secs(5),
+                            poll_fn(|cx| {
                                 if h3_conn.settings().enable_webtransport() {
-                                    break true;
+                                    return Poll::Ready(());
+                                } else {
+                                    let _ = h3_conn.inner.poll_control(cx);
+                                    return Poll::Pending;
                                 }
-                                tokio::task::yield_now().await;
-                            }
-                        })
+                            }),
+                        )
                         .await
                         .is_err()
                         {
