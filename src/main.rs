@@ -23,7 +23,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpStream;
 use tracing::level_filters::LevelFilter;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 mod config;
 
