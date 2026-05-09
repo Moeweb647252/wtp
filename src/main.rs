@@ -1,9 +1,11 @@
 use std::fs::File;
 use std::io::BufReader;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use bytes::Bytes;
+use fast_socks5::client::{Socks5Datagram, Socks5Stream};
 use futures_util::StreamExt;
 use h3::ConnectionState;
 use h3::ext::Protocol;
@@ -169,7 +171,7 @@ pub async fn handle_connection(
                         debug!("Connection settings: {:?}", h3_conn.settings());
                         let session = WebTransportSession::accept(req, stream, h3_conn).await?;
                         tracing::info!("Established webtransport session");
-                        handle_webtransport_session(headers, session).await?;
+                        handle_webtransport_session(config, headers, session).await?;
                         return Ok(());
                     }
                     _ => {
@@ -255,6 +257,7 @@ pub async fn redirect_upstream(
 }
 
 pub async fn handle_webtransport_session(
+    config: Arc<config::Config>,
     headers: HeaderMap,
     session: WebTransportSession<h3_quinn::Connection, Bytes>,
 ) -> anyhow::Result<()> {
@@ -270,24 +273,12 @@ pub async fn handle_webtransport_session(
         "tcp" => {
             loop {
                 match session.accept_bi().await {
-                    Ok(Some(AcceptedBi::BidiStream(_, mut stream))) => {
+                    Ok(Some(AcceptedBi::BidiStream(_, stream))) => {
+                        let config = config.clone();
                         let endpoint = endpoint.to_owned();
                         tokio::spawn(async move {
-                            let mut target_stream = match TcpStream::connect(&endpoint).await {
-                                Ok(s) => s,
-                                Err(err) => {
-                                    error!(
-                                        "Failed to connect to upstream addr: {} : {:?}",
-                                        endpoint, err
-                                    );
-                                    return;
-                                }
-                            };
-                            info!("Outgoing TCP connection established to {}", endpoint);
-                            if let Err(e) =
-                                tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
-                            {
-                                tracing::error!("TCP proxy stream error: {:?}", e);
+                            if let Err(err) = handle_tcp(config, &endpoint, stream).await {
+                                error!("Failed to handle TCP stream: {err:?}");
                             }
                         });
                     }
@@ -301,36 +292,107 @@ pub async fn handle_webtransport_session(
             }
         }
         "udp" => {
-            let mut tx = session.datagram_sender();
-            let mut rx = session.datagram_reader();
-            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-            socket.connect(endpoint).await?;
-            let socket = Arc::new(socket);
-            let socket_clone = socket.clone();
-            let send_task = async move {
-                loop {
-                    let datagram = rx.read_datagram().await?;
-                    socket.send(datagram.payload()).await?;
-                }
-                #[allow(unreachable_code)]
-                anyhow::Ok(())
-            };
-            let recv_task = async move {
-                let mut buf = [0u8; 65536];
-                loop {
-                    let n = socket_clone.recv(&mut buf).await?;
-                    tx.send_datagram(Bytes::copy_from_slice(&buf[..n]))?;
-                }
-                #[allow(unreachable_code)]
-                anyhow::Ok(())
-            };
-
-            tokio::select! {
-                res = send_task => return res,
-                res = recv_task => return res,
+            if let Err(err) = handle_udp(session, config, endpoint).await {
+                error!("Failed to handle UDP session: {err:?}");
             }
         }
         _ => anyhow::bail!("Corrupted proxy request {}", line!()),
     }
     Ok(())
+}
+
+async fn handle_tcp(
+    config: Arc<config::Config>,
+    endpoint: &str,
+    mut stream: h3_webtransport::stream::BidiStream<BidiStream<Bytes>, Bytes>,
+) -> anyhow::Result<()> {
+    if let Some(proxy_addr) = config.socks_proxy.as_ref() {
+        let (target_addr, target_port) = endpoint
+            .split_once(':')
+            .context(format!("Invalid endpoint format: {}", endpoint))?;
+        let mut target_stream = Socks5Stream::connect(
+            proxy_addr,
+            target_addr.to_owned(),
+            target_port.parse()?,
+            Default::default(),
+        )
+        .await
+        .context("failed to connect via socks5")?;
+        info!("Outgoing TCP connection established to {}", endpoint);
+        tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
+    } else {
+        let mut target_stream = TcpStream::connect(&endpoint)
+            .await
+            .context(format!("Failed to connect to upstream addr: {}", endpoint))?;
+        info!("Outgoing TCP connection established to {}", endpoint);
+        tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
+    }
+    .map_err(|e| anyhow!("TCP proxy stream error: {:?}", e))
+    .map(|_| ())
+}
+
+async fn handle_udp(
+    session: WebTransportSession<h3_quinn::Connection, Bytes>,
+    config: Arc<config::Config>,
+    endpoint: &str,
+) -> anyhow::Result<()> {
+    let mut tx = session.datagram_sender();
+    let mut rx = session.datagram_reader();
+    if let Some(proxy_addr) = config.socks_proxy.as_ref() {
+        let backing_socket = TcpStream::connect(proxy_addr)
+            .await
+            .context("Can not connect to socks server")?;
+        let socket = Socks5Datagram::bind(
+            backing_socket,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        )
+        .await?;
+        let target_addr: SocketAddr = endpoint.parse()?;
+        let send_task = async {
+            loop {
+                let datagram = rx.read_datagram().await?;
+                socket.send_to(datagram.payload(), target_addr).await?;
+            }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        };
+        let recv_task = async {
+            let mut buf = [0u8; 65536];
+            loop {
+                let (n, _addr) = socket.recv_from(&mut buf).await?;
+                tx.send_datagram(Bytes::copy_from_slice(&buf[..n]))?;
+            }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        };
+        tokio::select! {
+            res = send_task => return res,
+            res = recv_task => return res,
+        }
+    } else {
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect(endpoint).await?;
+        let send_task = async {
+            loop {
+                let datagram = rx.read_datagram().await?;
+                socket.send(datagram.payload()).await?;
+            }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        };
+        let recv_task = async {
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = socket.recv(&mut buf).await?;
+                tx.send_datagram(Bytes::copy_from_slice(&buf[..n]))?;
+            }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        };
+
+        tokio::select! {
+            res = send_task => return res,
+            res = recv_task => return res,
+        }
+    }
 }

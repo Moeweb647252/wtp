@@ -7,6 +7,7 @@ pub struct Config {
     pub cert: String,
     pub key: String,
     pub path: String,
+    pub socks_proxy: Option<String>,
 }
 
 pub async fn load_config(path: &str) -> anyhow::Result<Config> {
