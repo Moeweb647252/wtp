@@ -73,11 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
     transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
-    transport_config.receive_window(VarInt::from_u32(12 * 1024 * 1024));
+    transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024));
     transport_config.enable_segmentation_offload(true);
     transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    //transport_config.max_concurrent_bidi_streams(VarInt::from_u32(32));
-    //transport_config.max_concurrent_uni_streams(VarInt::from_u32(32));
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(32));
+    transport_config.max_concurrent_uni_streams(VarInt::from_u32(32));
 
     transport_config.congestion_controller_factory(Arc::new(config.cwnd.map_or(
         Default::default(),
