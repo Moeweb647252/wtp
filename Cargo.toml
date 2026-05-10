@@ -37,3 +37,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 rustls-pemfile = "2.2.0"
 fast-socks5 = "1.0.0"
 tikv-jemallocator = "0.6.1"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+strip = true
