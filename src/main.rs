@@ -18,6 +18,7 @@ use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper_util::client::legacy::Client;
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
+use quinn::VarInt;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -67,8 +68,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
-    transport_config.datagram_receive_buffer_size(Some(65536));
-    transport_config.datagram_send_buffer_size(65536);
+    transport_config.stream_receive_window(VarInt::from_u32(16 * 1024 * 1024));
+    transport_config.receive_window(VarInt::from_u32(32 * 1024 * 1024));
+    transport_config.enable_segmentation_offload(true);
+    transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
+    transport_config.congestion_controller_factory(Arc::new(config.cwnd.map_or(
+        Default::default(),
+        |cwnd| {
+            let mut config = quinn::congestion::BbrConfig::default();
+            config.initial_window(cwnd);
+            config
+        },
+    )));
     server_config.transport = Arc::new(transport_config);
     let endpoint = quinn::Endpoint::server(server_config, config.listen.parse()?)?;
     info!("listening on {}", config.listen);

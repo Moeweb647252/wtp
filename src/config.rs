@@ -8,6 +8,7 @@ pub struct Config {
     pub key: String,
     pub path: String,
     pub socks_proxy: Option<String>,
+    pub cwnd: Option<u64>,
 }
 
 pub async fn load_config(path: &str) -> anyhow::Result<Config> {
