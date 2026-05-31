@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  BINARY_NAME: wst
+  BINARY_NAME: wtp
 
 jobs:
   build:
