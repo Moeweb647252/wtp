@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use tikv_jemallocator::Jemalloc;
 #[cfg(target_os = "linux")]
 #[global_allocator]
