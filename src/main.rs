@@ -11,7 +11,7 @@ use std::task::Poll;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use fast_socks5::client::{Socks5Datagram, Socks5Stream};
 use futures_util::StreamExt;
 use futures_util::future::poll_fn;
@@ -34,6 +34,11 @@ use tracing::{error, info};
 
 mod config;
 
+// 共享给所有反代请求复用的 hyper 客户端类型，避免每次请求重建连接池。
+type ReqBody =
+    StreamBody<futures_util::stream::BoxStream<'static, Result<Frame<Bytes>, anyhow::Error>>>;
+type UpstreamClient = Client<HttpConnector, ReqBody>;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -44,6 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let config = Arc::new(config::load_config("config.toml").await?);
+    // 全程序共享一个 hyper 连接池，复用 keep-alive 连接，避免每请求重建 TCP/TLS。
+    let upstream_client: UpstreamClient =
+        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let cert_file = File::open(&config.cert).context("Failed to open cert file")?;
     let mut cert_reader = BufReader::new(cert_file);
     let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
@@ -94,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("listening on {}", config.listen);
     while let Some(new_conn) = endpoint.accept().await {
         let config = config.clone();
+        let upstream_client = upstream_client.clone();
         info!("new connection: {:?}", new_conn.remote_address());
         tokio::spawn(async move {
             match new_conn.await {
@@ -115,12 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
-                    // tracing::info!("Establishing WebTransport session");
-                    // // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
-                    // // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
-                    // // to the webtransport session.
-
-                    if let Err(err) = handle_connection(h3_conn, config).await {
+                    if let Err(err) = handle_connection(h3_conn, config, upstream_client).await {
                         tracing::error!("Failed to handle connection: {err:?}");
                     }
                 }
@@ -176,11 +180,13 @@ pub async fn handle_tcp_ssl(
 pub async fn handle_connection(
     mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes>,
     config: Arc<config::Config>,
+    upstream_client: UpstreamClient,
 ) -> anyhow::Result<()> {
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
                 let config = config.clone();
+                let upstream_client = upstream_client.clone();
                 let (req, stream) = resolver.resolve_request().await?;
                 let ext = req.extensions();
                 let path = req.uri().path();
@@ -195,10 +201,10 @@ pub async fn handle_connection(
                             Duration::from_secs(5),
                             poll_fn(|cx| {
                                 if h3_conn.settings().enable_webtransport() {
-                                    return Poll::Ready(());
+                                    Poll::Ready(())
                                 } else {
                                     let _ = h3_conn.inner.poll_control(cx);
-                                    return Poll::Pending;
+                                    Poll::Pending
                                 }
                             }),
                         )
@@ -215,7 +221,9 @@ pub async fn handle_connection(
                     }
                     _ => {
                         tokio::spawn(async move {
-                            if let Err(err) = redirect_upstream(req, stream, config).await {
+                            if let Err(err) =
+                                redirect_upstream(req, stream, config, upstream_client).await
+                            {
                                 error!("Failed to redirect upstream: {err:?}");
                             }
                         });
@@ -239,6 +247,7 @@ pub async fn redirect_upstream(
     req: http::Request<()>,
     stream: h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
     config: Arc<config::Config>, // 假设 config 封装在 Arc 中以便跨 task
+    client: UpstreamClient,
 ) -> anyhow::Result<()> {
     let (mut tx, rx) = stream.split();
     // 1. 构造明文 Upstream URL (http://...)
@@ -261,7 +270,13 @@ pub async fn redirect_upstream(
     // 构造一个异步流来拉取 H3 数据
     let request_body_stream = futures_util::stream::unfold(rx, |mut s| async move {
         match s.recv_data().await {
-            Ok(Some(data)) => Some((Ok::<_, anyhow::Error>(Frame::data(data)), s)),
+            Ok(Some(mut data)) => {
+                // 把 h3 返回的 impl Buf 转成 Bytes,使 body 类型固定为 Frame<Bytes>,
+                // 这样才能复用全程序共享的 UpstreamClient。
+                let len = data.remaining();
+                let bytes = data.copy_to_bytes(len);
+                Some((Ok::<_, anyhow::Error>(Frame::data(bytes)), s))
+            }
             Ok(None) => None, // 数据传输完毕
             Err(e) => Some((Err(anyhow::anyhow!("H3 recv error: {}", e)), s)),
         }
@@ -271,8 +286,7 @@ pub async fn redirect_upstream(
     let hyper_req_body = StreamBody::new(request_body_stream.boxed());
     let hyper_req = http::Request::from_parts(req_parts, hyper_req_body);
 
-    // 3. 发送请求到 Upstream (HTTP/1.1 或 HTTP/2)
-    let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    // 3. 发送请求到 Upstream (HTTP/1.1 或 HTTP/2)，复用共享 client 的连接池
     let upstream_res = client.request(hyper_req).await?;
 
     let (res_parts, res_body) = upstream_res.into_parts();
@@ -392,21 +406,21 @@ async fn handle_udp(
                 let datagram = rx.read_datagram().await?;
                 socket.send_to(datagram.payload(), target_addr).await?;
             }
-            #[allow(unreachable_code)]
-            anyhow::Ok(())
         };
         let recv_task = async {
-            let mut buf = [0u8; 65536];
+            // 复用同一块 BytesMut,避免每个 datagram 重新分配+拷贝
+            let mut buf = BytesMut::with_capacity(65536);
             loop {
+                buf.clear();
+                buf.resize(65536, 0);
                 let (n, _addr) = socket.recv_from(&mut buf).await?;
-                tx.send_datagram(Bytes::copy_from_slice(&buf[..n]))?;
+                let payload = buf.split_to(n).freeze();
+                tx.send_datagram(payload)?;
             }
-            #[allow(unreachable_code)]
-            anyhow::Ok(())
         };
         tokio::select! {
-            res = send_task => return res,
-            res = recv_task => return res,
+            res = send_task => res,
+            res = recv_task => res,
         }
     } else {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -416,22 +430,21 @@ async fn handle_udp(
                 let datagram = rx.read_datagram().await?;
                 socket.send(datagram.payload()).await?;
             }
-            #[allow(unreachable_code)]
-            anyhow::Ok(())
         };
         let recv_task = async {
-            let mut buf = [0u8; 65536];
+            let mut buf = BytesMut::with_capacity(65536);
             loop {
+                buf.clear();
+                buf.resize(65536, 0);
                 let n = socket.recv(&mut buf).await?;
-                tx.send_datagram(Bytes::copy_from_slice(&buf[..n]))?;
+                let payload = buf.split_to(n).freeze();
+                tx.send_datagram(payload)?;
             }
-            #[allow(unreachable_code)]
-            anyhow::Ok(())
         };
 
         tokio::select! {
-            res = send_task => return res,
-            res = recv_task => return res,
+            res = send_task => res,
+            res = recv_task => res,
         }
     }
 }
