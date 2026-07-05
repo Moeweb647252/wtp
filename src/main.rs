@@ -19,7 +19,7 @@ use h3::ConnectionState;
 use h3::ext::Protocol;
 use h3_quinn::BidiStream;
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
-use http::{HeaderMap, Method};
+use http::Method;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper_util::client::legacy::Client;
@@ -82,10 +82,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
+    // 单条流的接收窗口 8MB;按 RTT*带宽(BDP)估算,假设 100ms RTT、~640Mbps
+    // 链路 ≈ 8MB,够覆盖一条 WT 流满速时不被流控卡住。
     transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
+    // 整条 QUIC 连接的总接收窗口 16MB,约为单流窗口的 2 倍,允许同一连接
+    // 上的多条 WT 流并行传输时不互相挤占。
     transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024));
     transport_config.enable_segmentation_offload(true);
     transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
+    // 限制每条连接最大并发 bidi/uni 流为 32。对当前"单 WT session + 多 TCP 通道"
+    // 场景已留有余量;如需更高多路复用度可调大或移除该项(quinn 默认值更大)。
     transport_config.max_concurrent_bidi_streams(VarInt::from_u32(32));
     transport_config.max_concurrent_uni_streams(VarInt::from_u32(32));
 
@@ -100,39 +106,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server_config.transport = Arc::new(transport_config);
     let endpoint = quinn::Endpoint::server(server_config, config.listen.parse()?)?;
     info!("listening on {}", config.listen);
-    while let Some(new_conn) = endpoint.accept().await {
-        let config = config.clone();
-        let upstream_client = upstream_client.clone();
-        info!("new connection: {:?}", new_conn.remote_address());
-        tokio::spawn(async move {
-            match new_conn.await {
-                Ok(conn) => {
-                    info!("new http3 established");
-                    let h3_conn = match h3::server::builder()
-                        .enable_webtransport(true)
-                        .enable_extended_connect(true)
-                        .enable_datagram(true)
-                        .max_webtransport_sessions((1_u64 << 62) - 1)
-                        .send_grease(true)
-                        .build(h3_quinn::Connection::new(conn))
-                        .await
-                    {
-                        Ok(conn) => conn,
-                        Err(err) => {
-                            error!("handshaking failed: {:?}", err);
-                            return;
-                        }
-                    };
+    // 跟踪所有已 spawn 的 QUIC 连接任务,以便在收到 Ctrl-C 时优雅等待它们结束
+    let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            new_conn = endpoint.accept() => match new_conn {
+                Some(new_conn) => {
+                    let config = config.clone();
+                    let upstream_client = upstream_client.clone();
+                    info!("new connection: {:?}", new_conn.remote_address());
+                    conns.spawn(async move {
+                        match new_conn.await {
+                            Ok(conn) => {
+                                info!("new http3 established");
+                                let h3_conn = match h3::server::builder()
+                                    .enable_webtransport(true)
+                                    .enable_extended_connect(true)
+                                    .enable_datagram(true)
+                                    .max_webtransport_sessions((1_u64 << 62) - 1)
+                                    .send_grease(true)
+                                    .build(h3_quinn::Connection::new(conn))
+                                    .await
+                                {
+                                    Ok(conn) => conn,
+                                    Err(err) => {
+                                        error!("handshaking failed: {:?}", err);
+                                        return;
+                                    }
+                                };
 
-                    if let Err(err) = handle_connection(h3_conn, config, upstream_client).await {
-                        tracing::error!("Failed to handle connection: {err:?}");
-                    }
+                                if let Err(err) =
+                                    handle_connection(h3_conn, config, upstream_client).await
+                                {
+                                    tracing::error!("Failed to handle connection: {err:?}");
+                                }
+                            }
+                            Err(err) => {
+                                error!("accepting connection failed: {:?}", err);
+                            }
+                        }
+                    });
                 }
-                Err(err) => {
-                    error!("accepting connection failed: {:?}", err);
-                }
+                None => break, // endpoint 关闭,不再接受新连接
+            },
+            _ = tokio::signal::ctrl_c() => {
+                info!("received Ctrl-C, initiating graceful shutdown");
+                // 关闭监听 socket;已建立的连接不会立刻被切断,
+                // 它们会因为 endpoint 被关闭而通过 quinn 收到错误并自然退出。
+                endpoint.close(VarInt::from_u32(0), b"shutting down");
+                break;
             }
-        });
+        }
+    }
+    // 给在飞连接一段上限时间优雅结束,超时后强制 abort。
+    info!(
+        "waiting for {} in-flight connection task(s) to finish (max 30s)",
+        conns.len()
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match tokio::time::timeout_at(deadline, conns.join_next()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,           // 所有连接任务都已结束
+            Err(_elapsed) => {
+                let remaining = conns.len();
+                conns.abort_all();
+                info!("graceful shutdown timed out, aborted {remaining} task(s)");
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -195,7 +237,18 @@ pub async fn handle_connection(
                         if ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
                             && config.path.eq(path) =>
                     {
-                        let headers = req.headers().to_owned();
+                        // 只提取我们关心的两个 header,避免克隆整张 HeaderMap
+                        let headers = req.headers();
+                        let protocol = headers
+                            .get("proxy-protocol")
+                            .context("missing proxy-protocol header")?
+                            .to_str()?
+                            .to_owned();
+                        let endpoint = headers
+                            .get("proxy-endpoint")
+                            .context("missing proxy-endpoint header")?
+                            .to_str()?
+                            .to_owned();
 
                         if tokio::time::timeout(
                             Duration::from_secs(5),
@@ -216,7 +269,7 @@ pub async fn handle_connection(
                         }
                         let session = WebTransportSession::accept(req, stream, h3_conn).await?;
                         tracing::info!("Established webtransport session");
-                        handle_webtransport_session(config, headers, session).await?;
+                        handle_webtransport_session(config, protocol, endpoint, session).await?;
                         return Ok(());
                     }
                     _ => {
@@ -311,24 +364,17 @@ pub async fn redirect_upstream(
 
 pub async fn handle_webtransport_session(
     config: Arc<config::Config>,
-    headers: HeaderMap,
+    protocol: String,
+    endpoint: String,
     session: WebTransportSession<h3_quinn::Connection, Bytes>,
 ) -> anyhow::Result<()> {
-    let protocol = headers
-        .get("proxy-protocol")
-        .context(format!("Corrupted proxy request {}", line!()))?
-        .to_str()?;
-    let endpoint = headers
-        .get("proxy-endpoint")
-        .context(format!("Corrupted proxy request {}", line!()))?
-        .to_str()?;
-    match protocol {
+    match protocol.as_str() {
         "tcp" => {
             loop {
                 match session.accept_bi().await {
                     Ok(Some(AcceptedBi::BidiStream(_, stream))) => {
                         let config = config.clone();
-                        let endpoint = endpoint.to_owned();
+                        let endpoint = endpoint.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp(config, &endpoint, stream).await {
                                 error!("Failed to handle TCP stream: {err:?}");
@@ -345,11 +391,11 @@ pub async fn handle_webtransport_session(
             }
         }
         "udp" => {
-            if let Err(err) = handle_udp(session, config, endpoint).await {
+            if let Err(err) = handle_udp(session, config, &endpoint).await {
                 error!("Failed to handle UDP session: {err:?}");
             }
         }
-        _ => anyhow::bail!("Corrupted proxy request {}", line!()),
+        other => anyhow::bail!("unknown proxy-protocol: {other}"),
     }
     Ok(())
 }
