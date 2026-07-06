@@ -90,10 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024));
     transport_config.enable_segmentation_offload(true);
     transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    // 限制每条连接最大并发 bidi/uni 流为 32。对当前"单 WT session + 多 TCP 通道"
-    // 场景已留有余量;如需更高多路复用度可调大或移除该项(quinn 默认值更大)。
-    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(32));
-    transport_config.max_concurrent_uni_streams(VarInt::from_u32(32));
+    // 不显式设置 max_concurrent_bidi/uni_streams,沿用 quinn 默认(各 ~100)。
+    // 32 之前的上限对"一连接多 WT session + 多 TCP 通道"场景偏紧,使用默认更稳。
 
     transport_config.congestion_controller_factory(Arc::new(config.cwnd.map_or(
         Default::default(),
