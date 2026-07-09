@@ -402,23 +402,42 @@ pub async fn handle_webtransport_session(
     Ok(())
 }
 
+/// 把 "host:port" 形式的 endpoint 拆成 (host, port)。
+/// host 可以是域名或 IP 字面量;IPv6 字面量需带方括号(如 "[::1]:443")。
+/// 用于需要把域名原样传递(如 socks5 上游)而不在本端预解析的场景。
+/// 纯 "IP:port" 先走 SocketAddr::parse 以正确处理 IPv6 方括号语法,
+/// 失败再按最后一个 ':' 拆分,兼容 "domain:port" 这类 SocketAddr 无法
+/// 直接 parse 的形式。
+fn endpoint_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
+    if let Ok(addr) = endpoint.parse::<SocketAddr>() {
+        return Ok((addr.ip().to_string(), addr.port()));
+    }
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .with_context(|| format!("Invalid endpoint format: {}", endpoint))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("Invalid port in endpoint: {}", endpoint))?;
+    // 去掉 IPv6 字面量的方括号,使 fast-socks5 的 ToSocketAddrs 能解析裸 IPv6。
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok((host.to_owned(), port))
+}
+
 async fn handle_tcp(
     config: Arc<config::Config>,
     endpoint: &str,
     mut stream: h3_webtransport::stream::BidiStream<BidiStream<Bytes>, Bytes>,
 ) -> anyhow::Result<()> {
-    // 与 UDP 路径一致:整个 endpoint 解析为 SocketAddr,避免 split_once(':')
-    // 对 IPv6 字面量(如 "[::1]:443")错误分割。
-    let addr: SocketAddr = endpoint
-        .parse()
-        .context(format!("Invalid endpoint format: {}", endpoint))?;
     if let Some(proxy_addr) = config.socks_proxy.as_ref() {
-        // Socks5Stream::connect 接收 (String, u16);addr.ip().to_string() 产出无方括号的
-        // 裸 IPv4/IPv6 字符串,fast-socks5 的 (&str, u16).to_target_addr() 会正确解析。
+        // 走 socks5 时把 host 原样传给上游 socks5,由其负责 DNS 解析,
+        // 避免本端把域名预先解析成 IP 后丢失域名信息(也省一次本地解析)。
+        // fast-socks5 的 connect 接收 (String, u16),host 既可以是域名也可以是
+        // 无方括号的裸 IP,其内部 ToSocketAddrs 都能正确处理。
+        let (host, port) = endpoint_host_port(endpoint)?;
         let mut target_stream = Socks5Stream::connect(
             proxy_addr,
-            addr.ip().to_string(),
-            addr.port(),
+            host,
+            port,
             Default::default(),
         )
         .await
@@ -426,9 +445,16 @@ async fn handle_tcp(
         info!("Outgoing TCP connection established to {}", endpoint);
         tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
     } else {
+        // 直连用 tokio 的 lookup_host:既支持 IP 字面量也支持域名 DNS 解析,
+        // 取首个解析结果 connect(与原"固定一个 SocketAddr"语义一致)。
+        let addr = tokio::net::lookup_host(endpoint)
+            .await
+            .with_context(|| format!("Failed to resolve endpoint: {}", endpoint))?
+            .next()
+            .with_context(|| format!("No address resolved for endpoint: {}", endpoint))?;
         let mut target_stream = TcpStream::connect(addr)
             .await
-            .context(format!("Failed to connect to upstream addr: {}", endpoint))?;
+            .with_context(|| format!("Failed to connect to upstream addr: {}", endpoint))?;
         info!("Outgoing TCP connection established to {}", endpoint);
         tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
     }
@@ -452,7 +478,13 @@ async fn handle_udp(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         )
         .await?;
-        let target_addr: SocketAddr = endpoint.parse()?;
+        // endpoint 可能是域名,SocketAddr::parse 无法直接 parse,
+        // 用 lookup_host 走 DNS 解析取首个地址(与 TCP 直连分支一致)。
+        let target_addr = tokio::net::lookup_host(endpoint)
+            .await
+            .with_context(|| format!("Failed to resolve endpoint: {}", endpoint))?
+            .next()
+            .with_context(|| format!("No address resolved for endpoint: {}", endpoint))?;
         let send_task = async {
             loop {
                 let datagram = rx.read_datagram().await?;
