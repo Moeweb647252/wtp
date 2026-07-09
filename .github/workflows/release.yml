@@ -43,6 +43,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package release archive (Unix)
