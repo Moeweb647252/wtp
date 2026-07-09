@@ -1,6 +1,6 @@
 [package]
 name = "wtp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls-pemfile = "2.2"
 fast-socks5 = "1.0"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = "0.7"
 
 [profile.release]
