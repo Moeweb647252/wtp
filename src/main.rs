@@ -82,16 +82,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
-    // 单条流的接收窗口 8MB;按 RTT*带宽(BDP)估算,假设 100ms RTT、~640Mbps
-    // 链路 ≈ 8MB,够覆盖一条 WT 流满速时不被流控卡住。
+    // 单条流的接收窗口 8 MiB;按 RTT*带宽(BDP)估算,假设 100ms RTT、~640Mbps
+    // 链路 ≈ 8 MiB,够覆盖一条 WT 流满速时不被流控卡住。
     transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
-    // 整条 QUIC 连接的总接收窗口 16MB,约为单流窗口的 2 倍,允许同一连接
+    // 整条 QUIC 连接的总接收窗口 16 MiB,约为单流窗口的 2 倍,允许同一连接
     // 上的多条 WT 流并行传输时不互相挤占。
     transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024));
     transport_config.enable_segmentation_offload(true);
-    transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    // 不显式设置 max_concurrent_bidi/uni_streams,沿用 quinn 默认(各 ~100)。
-    // 32 之前的上限对"一连接多 WT session + 多 TCP 通道"场景偏紧,使用默认更稳。
+    // 与客户端 MaxIdleTimeout(5min)对齐:双方都 60s keepalive、5min idle,
+    // keepalive 失败时两端判定连接死亡的时机一致,避免一端先判死后另一端
+    // 还在使用导致"莫名端掉"的体验。
+    transport_config.max_idle_timeout(Some(VarInt::from_u32(300_000).into()));
 
     transport_config.congestion_controller_factory(Arc::new(config.cwnd.map_or(
         Default::default(),
@@ -121,7 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .enable_webtransport(true)
                                     .enable_extended_connect(true)
                                     .enable_datagram(true)
-                                    .max_webtransport_sessions((1_u64 << 62) - 1)
+                                    // 实际上 handle_connection 只处理一个 WT session
+                                    // 就 return,故设为 1 与行为一致,避免设置成
+                                    // (1<<62)-1 带来"支持多 session"的误导。
+                                    .max_webtransport_sessions(1)
                                     .send_grease(true)
                                     .build(h3_quinn::Connection::new(conn))
                                     .await
@@ -403,14 +407,18 @@ async fn handle_tcp(
     endpoint: &str,
     mut stream: h3_webtransport::stream::BidiStream<BidiStream<Bytes>, Bytes>,
 ) -> anyhow::Result<()> {
+    // 与 UDP 路径一致:整个 endpoint 解析为 SocketAddr,避免 split_once(':')
+    // 对 IPv6 字面量(如 "[::1]:443")错误分割。
+    let addr: SocketAddr = endpoint
+        .parse()
+        .context(format!("Invalid endpoint format: {}", endpoint))?;
     if let Some(proxy_addr) = config.socks_proxy.as_ref() {
-        let (target_addr, target_port) = endpoint
-            .split_once(':')
-            .context(format!("Invalid endpoint format: {}", endpoint))?;
+        // Socks5Stream::connect 接收 (String, u16);addr.ip().to_string() 产出无方括号的
+        // 裸 IPv4/IPv6 字符串,fast-socks5 的 (&str, u16).to_target_addr() 会正确解析。
         let mut target_stream = Socks5Stream::connect(
             proxy_addr,
-            target_addr.to_owned(),
-            target_port.parse()?,
+            addr.ip().to_string(),
+            addr.port(),
             Default::default(),
         )
         .await
@@ -418,7 +426,7 @@ async fn handle_tcp(
         info!("Outgoing TCP connection established to {}", endpoint);
         tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
     } else {
-        let mut target_stream = TcpStream::connect(&endpoint)
+        let mut target_stream = TcpStream::connect(addr)
             .await
             .context(format!("Failed to connect to upstream addr: {}", endpoint))?;
         info!("Outgoing TCP connection established to {}", endpoint);
