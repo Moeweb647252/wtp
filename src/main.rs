@@ -6,13 +6,12 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::task::Poll;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
-use bytes::{Buf, Bytes, BytesMut};
-use fast_socks5::client::{Socks5Datagram, Socks5Stream};
+use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
 use futures_util::future::poll_fn;
 use h3::ConnectionState;
@@ -28,15 +27,17 @@ use quinn::VarInt;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 
 mod config;
+mod socks5;
 
 // 共享给所有反代请求复用的 hyper 客户端类型，避免每次请求重建连接池。
 type ReqBody =
-    StreamBody<futures_util::stream::BoxStream<'static, Result<Frame<Bytes>, anyhow::Error>>>;
+    StreamBody<futures_util::stream::BoxStream<'static, Result<Frame<Bytes>, std::io::Error>>>;
 type UpstreamClient = Client<HttpConnector, ReqBody>;
 
 #[tokio::main]
@@ -113,19 +114,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(new_conn) => {
                     let config = config.clone();
                     let upstream_client = upstream_client.clone();
-                    info!("new connection: {:?}", new_conn.remote_address());
+                    info!(remote = %new_conn.remote_address(), "new QUIC connection");
                     conns.spawn(async move {
                         match new_conn.await {
                             Ok(conn) => {
-                                info!("new http3 established");
+                                tracing::debug!("HTTP/3 connection established");
                                 let h3_conn = match h3::server::builder()
                                     .enable_webtransport(true)
                                     .enable_extended_connect(true)
                                     .enable_datagram(true)
-                                    // 实际上 handle_connection 只处理一个 WT session
-                                    // 就 return,故设为 1 与行为一致,避免设置成
-                                    // (1<<62)-1 带来"支持多 session"的误导。
-                                    .max_webtransport_sessions(1)
+                                    .max_webtransport_sessions(config.max_webtransport_sessions)
                                     .send_grease(true)
                                     .build(h3_quinn::Connection::new(conn))
                                     .await
@@ -169,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match tokio::time::timeout_at(deadline, conns.join_next()).await {
             Ok(Some(_)) => continue,
-            Ok(None) => break,           // 所有连接任务都已结束
+            Ok(None) => break, // 所有连接任务都已结束
             Err(_elapsed) => {
                 let remaining = conns.len();
                 conns.abort_all();
@@ -192,13 +190,14 @@ pub async fn handle_tcp_ssl(
     let port = uri.port_u16().unwrap_or(80);
     loop {
         let (stream, addr) = listener.accept().await?;
-        info!("new connection: {:?}", addr);
+        tracing::debug!(remote = %addr, "new TCP connection");
+
         let acceptor = acceptor.clone();
         let host = host.to_owned();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(mut stream) => {
-                    info!("new ssl established");
+                    tracing::debug!("TLS connection established");
                     let mut target_stream = match tokio::net::TcpStream::connect((host, port)).await
                     {
                         Ok(s) => s,
@@ -330,10 +329,10 @@ pub async fn redirect_upstream(
                 // 这样才能复用全程序共享的 UpstreamClient。
                 let len = data.remaining();
                 let bytes = data.copy_to_bytes(len);
-                Some((Ok::<_, anyhow::Error>(Frame::data(bytes)), s))
+                Some((Ok::<_, std::io::Error>(Frame::data(bytes)), s))
             }
             Ok(None) => None, // 数据传输完毕
-            Err(e) => Some((Err(anyhow::anyhow!("H3 recv error: {}", e)), s)),
+            Err(e) => Some((Err(std::io::Error::other(format!("H3 recv error: {e}"))), s)),
         }
     });
 
@@ -418,7 +417,7 @@ fn endpoint_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
     let port: u16 = port
         .parse()
         .with_context(|| format!("Invalid port in endpoint: {}", endpoint))?;
-    // 去掉 IPv6 字面量的方括号,使 fast-socks5 的 ToSocketAddrs 能解析裸 IPv6。
+    // 去掉 IPv6 字面量的方括号以便 SOCKS5 地址编码。
     let host = host.trim_start_matches('[').trim_end_matches(']');
     Ok((host.to_owned(), port))
 }
@@ -431,18 +430,10 @@ async fn handle_tcp(
     if let Some(proxy_addr) = config.socks_proxy.as_ref() {
         // 走 socks5 时把 host 原样传给上游 socks5,由其负责 DNS 解析,
         // 避免本端把域名预先解析成 IP 后丢失域名信息(也省一次本地解析)。
-        // fast-socks5 的 connect 接收 (String, u16),host 既可以是域名也可以是
-        // 无方括号的裸 IP,其内部 ToSocketAddrs 都能正确处理。
+        // 内建 SOCKS5 客户端保留域名，让代理服务端负责 DNS 解析。
         let (host, port) = endpoint_host_port(endpoint)?;
-        let mut target_stream = Socks5Stream::connect(
-            proxy_addr,
-            host,
-            port,
-            Default::default(),
-        )
-        .await
-        .context("failed to connect via socks5")?;
-        info!("Outgoing TCP connection established to {}", endpoint);
+        let mut target_stream = socks5::connect(proxy_addr, &host, port).await?;
+        tracing::debug!(target = endpoint, "outgoing TCP connection established");
         tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
     } else {
         // 直连用 tokio 的 lookup_host:既支持 IP 字面量也支持域名 DNS 解析,
@@ -455,7 +446,7 @@ async fn handle_tcp(
         let mut target_stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("Failed to connect to upstream addr: {}", endpoint))?;
-        info!("Outgoing TCP connection established to {}", endpoint);
+        tracing::debug!(target = endpoint, "outgoing TCP connection established");
         tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
     }
     .map_err(|e| anyhow!("TCP proxy stream error: {:?}", e))
@@ -470,41 +461,33 @@ async fn handle_udp(
     let mut tx = session.datagram_sender();
     let mut rx = session.datagram_reader();
     if let Some(proxy_addr) = config.socks_proxy.as_ref() {
-        let backing_socket = TcpStream::connect(proxy_addr)
-            .await
-            .context("Can not connect to socks server")?;
-        let socket = Socks5Datagram::bind(
-            backing_socket,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        )
-        .await?;
-        // endpoint 可能是域名,SocketAddr::parse 无法直接 parse,
-        // 用 lookup_host 走 DNS 解析取首个地址(与 TCP 直连分支一致)。
-        let target_addr = tokio::net::lookup_host(endpoint)
-            .await
-            .with_context(|| format!("Failed to resolve endpoint: {}", endpoint))?
-            .next()
-            .with_context(|| format!("No address resolved for endpoint: {}", endpoint))?;
-        let send_task = async {
-            loop {
-                let datagram = rx.read_datagram().await?;
-                socket.send_to(datagram.payload(), target_addr).await?;
+        let (mut control, relay_addr) = socks5::udp_associate(proxy_addr).await?;
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        let (host, port) = endpoint_host_port(endpoint)?;
+        let mut outbound = Vec::with_capacity(65_536);
+        let mut inbound = vec![0u8; 65_536];
+        loop {
+            tokio::select! {
+                result = control.read_u8() => {
+                    match result {
+                        Ok(_) => anyhow::bail!("unexpected data on SOCKS5 UDP control connection"),
+                        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            anyhow::bail!("SOCKS5 UDP control connection closed")
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                datagram = rx.read_datagram() => {
+                    let datagram = datagram?;
+                    socks5::encode_udp_packet(&mut outbound, &host, port, datagram.payload())?;
+                    socket.send_to(&outbound, relay_addr).await?;
+                }
+                result = socket.recv_from(&mut inbound) => {
+                    let (n, _) = result?;
+                    let packet = socks5::decode_udp_packet(&inbound[..n])?;
+                    tx.send_datagram(Bytes::copy_from_slice(&inbound[packet.payload_start..n]))?;
+                }
             }
-        };
-        let recv_task = async {
-            // 复用同一块 BytesMut,避免每个 datagram 重新分配+拷贝
-            let mut buf = BytesMut::with_capacity(65536);
-            loop {
-                buf.clear();
-                buf.resize(65536, 0);
-                let (n, _addr) = socket.recv_from(&mut buf).await?;
-                let payload = buf.split_to(n).freeze();
-                tx.send_datagram(payload)?;
-            }
-        };
-        tokio::select! {
-            res = send_task => res,
-            res = recv_task => res,
         }
     } else {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -516,12 +499,10 @@ async fn handle_udp(
             }
         };
         let recv_task = async {
-            let mut buf = BytesMut::with_capacity(65536);
+            let mut buf = vec![0u8; 65_536];
             loop {
-                buf.clear();
-                buf.resize(65536, 0);
                 let n = socket.recv(&mut buf).await?;
-                let payload = buf.split_to(n).freeze();
+                let payload = Bytes::copy_from_slice(&buf[..n]);
                 tx.send_datagram(payload)?;
             }
         };
