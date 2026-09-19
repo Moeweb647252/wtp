@@ -1,6 +1,6 @@
 /target
 *.pem
-*.cer
 *.key
 config.toml
 .gitignore
+/.freebuff

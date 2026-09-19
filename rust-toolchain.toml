@@ -1,0 +1,8 @@
+# 项目工具链固定为 nightly:本地编译更快,且本地、IDE 使用同一套
+# cargo / rustc / clippy / rustfmt。
+#
+# rust-toolchain.toml 优先于 rustup 的全局 default toolchain,
+# 因此不会再出现某个 shell 解析到别的 toolchain 的情况。
+[toolchain]
+channel = "nightly"
+components = ["clippy", "rustfmt"]
