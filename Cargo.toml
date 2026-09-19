@@ -18,7 +18,7 @@ futures-util = "0.3"
 h3 = "0.0"
 h3-quinn = { version = "0.0", features = ["datagram", "tracing"] }
 h3-webtransport = "0.1"
-http = "1.4"
+http = "1.5"
 http-body-util = "0.1"
 hyper = { version = "1.9", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = [
@@ -29,7 +29,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 rustls = "0.23"
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.52", features = [
+tokio = { version = "1.53", features = [
     "rt-multi-thread",
     "macros",
     "net",
@@ -38,14 +38,14 @@ tokio = { version = "1.52", features = [
     "time",
     "signal",
 ] }
-tokio-rustls = "0.26.4"
+tokio-rustls = "0.26"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls-pemfile = "2.2"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = "0.7"
+mimalloc = "0.1"
 
 [profile.release]
 opt-level = 3
