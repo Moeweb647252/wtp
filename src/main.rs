@@ -492,12 +492,12 @@ async fn handle_tcp(
     endpoint: &str,
     mut stream: h3_webtransport::stream::BidiStream<BidiStream<Bytes>, Bytes>,
 ) -> anyhow::Result<()> {
-    if let Some(proxy_addr) = config.socks_proxy.as_ref() {
+    if let Some(proxy) = config.socks_proxy.as_ref() {
         // 走 socks5 时把 host 原样传给上游 socks5,由其负责 DNS 解析,
         // 避免本端把域名预先解析成 IP 后丢失域名信息(也省一次本地解析)。
         // 内建 SOCKS5 客户端保留域名，让代理服务端负责 DNS 解析。
         let (host, port) = endpoint_host_port(endpoint)?;
-        let mut target_stream = socks5::connect(proxy_addr, &host, port).await?;
+        let mut target_stream = socks5::connect(&proxy.addr, proxy.auth(), &host, port).await?;
         tracing::debug!(target = endpoint, "outgoing TCP connection established");
         tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
     } else {
@@ -528,8 +528,8 @@ async fn handle_udp(
 ) -> anyhow::Result<()> {
     let mut tx = session.datagram_sender();
     let mut rx = session.datagram_reader();
-    if let Some(proxy_addr) = config.socks_proxy.as_ref() {
-        let (mut control, relay_addr) = socks5::udp_associate(proxy_addr).await?;
+    if let Some(proxy) = config.socks_proxy.as_ref() {
+        let (mut control, relay_addr) = socks5::udp_associate(&proxy.addr, proxy.auth()).await?;
         // relay 可能是 IPv6,本地 socket 必须绑定同族地址才能 send_to。
         let bind = if relay_addr.is_ipv6() {
             "[::]:0"

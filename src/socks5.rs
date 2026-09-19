@@ -6,23 +6,34 @@ use tokio::time::{Duration, timeout};
 
 const VERSION: u8 = 5;
 const NO_AUTH: u8 = 0;
+const METHOD_USER_PASS: u8 = 2;
+/// RFC 1929 用户名密码子协商的版本号:是 0x01 而不是 0x05,易踩坑点。
+const AUTH_VERSION: u8 = 1;
 const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 const ATYP_IPV4: u8 = 1;
 const ATYP_DOMAIN: u8 = 3;
 const ATYP_IPV6: u8 = 4;
 
-pub async fn connect(proxy: &str, host: &str, port: u16) -> Result<TcpStream> {
+pub async fn connect(
+    proxy: &str,
+    auth: Option<(&str, &str)>,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream> {
     let mut stream = connect_proxy(proxy).await?;
-    handshake(&mut stream).await?;
+    handshake(&mut stream, auth).await?;
     // CONNECT 回复里的 BND.ADDR/BND.PORT 是代理出站的本地地址,对调用方无用。
     let _ = request(&mut stream, CMD_CONNECT, host, port).await?;
     Ok(stream)
 }
 
-pub async fn udp_associate(proxy: &str) -> Result<(TcpStream, SocketAddr)> {
+pub async fn udp_associate(
+    proxy: &str,
+    auth: Option<(&str, &str)>,
+) -> Result<(TcpStream, SocketAddr)> {
     let mut stream = connect_proxy(proxy).await?;
-    handshake(&mut stream).await?;
+    handshake(&mut stream, auth).await?;
     // UDP ASSOCIATE 只会收到一条回复,request() 在解码它时顺带返回 relay 地址;
     // 之后再读一次回复会永远阻塞(代理不会发第二条)。
     let relay = request(&mut stream, CMD_UDP_ASSOCIATE, "0.0.0.0", 0).await?;
@@ -44,12 +55,59 @@ async fn connect_proxy(proxy: &str) -> Result<TcpStream> {
     Ok(timeout(Duration::from_secs(10), TcpStream::connect(proxy)).await??)
 }
 
-async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
-    stream.write_all(&[VERSION, 1, NO_AUTH]).await?;
+async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    auth: Option<(&str, &str)>,
+) -> Result<()> {
+    // 配了凭据就只提供 USERNAME/PASSWORD(0x02):必须用认证,不静默降级成无认证。
+    let method = if auth.is_some() {
+        METHOD_USER_PASS
+    } else {
+        NO_AUTH
+    };
+    stream.write_all(&[VERSION, 1, method]).await?;
     let mut response = [0; 2];
     stream.read_exact(&mut response).await?;
-    if response != [VERSION, NO_AUTH] {
+    if response != [VERSION, method] {
+        if auth.is_some() {
+            bail!("SOCKS5 proxy does not accept username/password authentication");
+        }
         bail!("SOCKS5 proxy does not support no authentication");
+    }
+    if let Some((user, pass)) = auth {
+        authenticate(stream, user, pass).await?;
+    }
+    Ok(())
+}
+
+/// RFC 1929 子协商:发送 `[0x01, ulen, uname, plen, passwd]`,status 0x00 表示成功。
+async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    user: &str,
+    pass: &str,
+) -> Result<()> {
+    // config 解析时已校验过长度,这里再做一次双保险(防止将来有新的调用方绕过)。
+    let ulen = u8::try_from(user.len()).context("SOCKS5 username exceeds 255 bytes")?;
+    let plen = u8::try_from(pass.len()).context("SOCKS5 password exceeds 255 bytes")?;
+    if ulen == 0 || plen == 0 {
+        bail!("empty SOCKS5 username or password");
+    }
+    let mut buf = Vec::with_capacity(3 + user.len() + pass.len());
+    buf.extend_from_slice(&[AUTH_VERSION, ulen]);
+    buf.extend_from_slice(user.as_bytes());
+    buf.push(plen);
+    buf.extend_from_slice(pass.as_bytes());
+    stream.write_all(&buf).await?;
+    let mut response = [0; 2];
+    stream.read_exact(&mut response).await?;
+    if response[0] != AUTH_VERSION {
+        bail!("invalid SOCKS5 auth reply version: 0x{:02x}", response[0]);
+    }
+    if response[1] != 0 {
+        bail!(
+            "SOCKS5 username/password authentication failed: status 0x{:02x}",
+            response[1]
+        );
     }
     Ok(())
 }
@@ -260,5 +318,198 @@ mod tests {
         );
         let explicit: SocketAddr = "198.51.100.7:9".parse().unwrap();
         assert_eq!(effective_relay(explicit, proxy), explicit);
+    }
+
+    /// 假代理:校验客户端的方法协商字节,按参数回应;`auth_reply` 为 Some 时
+    /// 继续校验子协商字节(凭据固定 user/pass)并按给定 status 回复。
+    /// 全程 1s 超时防挂起。
+    async fn run_handshake(
+        auth: Option<(&str, &str)>,
+        method_reply: u8,
+        auth_reply: Option<u8>,
+    ) -> Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let expect_method = if auth.is_some() {
+            METHOD_USER_PASS
+        } else {
+            NO_AUTH
+        };
+        tokio::spawn(async move {
+            let mut greeting = [0u8; 3];
+            server.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [VERSION, 1, expect_method]);
+            server.write_all(&[VERSION, method_reply]).await.unwrap();
+            if let Some(status) = auth_reply {
+                // [0x01, ulen=4, "user", plen=4, "pass"]
+                let mut req = [0u8; 11];
+                server.read_exact(&mut req).await.unwrap();
+                assert_eq!(&req, b"\x01\x04user\x04pass");
+                server.write_all(&[AUTH_VERSION, status]).await.unwrap();
+            }
+        });
+        timeout(Duration::from_secs(1), handshake(&mut client, auth))
+            .await
+            .expect("handshake must not hang")
+    }
+
+    #[tokio::test]
+    async fn no_auth_handshake_unchanged() {
+        run_handshake(None, NO_AUTH, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticates_with_username_password() {
+        run_handshake(Some(("user", "pass")), METHOD_USER_PASS, Some(0))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_password() {
+        let err = run_handshake(Some(("user", "pass")), METHOD_USER_PASS, Some(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("authentication failed"));
+    }
+
+    #[tokio::test]
+    async fn rejects_server_without_user_pass_support() {
+        // 服务端回 0xFF(无可接受方法)或回 0x00(想降级成无认证)都要报错。
+        for reply in [0xFF, NO_AUTH] {
+            let err = run_handshake(Some(("user", "pass")), reply, None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("username/password"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_or_overlong_credentials() {
+        let (mut client, _server) = tokio::io::duplex(64);
+        assert!(authenticate(&mut client, "", "p").await.is_err());
+        assert!(authenticate(&mut client, "u", "").await.is_err());
+        let long = "x".repeat(256);
+        assert!(authenticate(&mut client, &long, "p").await.is_err());
+        assert!(authenticate(&mut client, "u", &long).await.is_err());
+    }
+
+    /// 手工冒烟:连真实 SOCKS5 代理验证 RFC 1929 认证 + CONNECT 回包。
+    /// 凭据从环境变量读,不落库。运行:
+    /// `WTP_SMOKE_PROXY=user:pass:host:port cargo test smoke -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires a real SOCKS5 proxy"]
+    async fn smoke_tcp_connect_with_auth() {
+        let Ok(proxy) = std::env::var("WTP_SMOKE_PROXY") else {
+            eprintln!("WTP_SMOKE_PROXY not set, skipping");
+            return;
+        };
+        let proxy = crate::config::SocksProxy::parse(&proxy).unwrap();
+        let target = std::env::var("WTP_SMOKE_TARGET").unwrap_or_else(|_| "example.com:80".into());
+        let (host, port) = target.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+
+        let mut stream = timeout(
+            Duration::from_secs(10),
+            connect(&proxy.addr, proxy.auth(), host, port),
+        )
+        .await
+        .expect("connect timed out")
+        .unwrap();
+        stream
+            .write_all(format!("GET / HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        // HTTP/1.0 默认短连接,服务端回完即关,read_to_end 能读到 EOF。
+        let mut body = Vec::new();
+        timeout(Duration::from_secs(10), stream.read_to_end(&mut body))
+            .await
+            .expect("read timed out")
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.starts_with("HTTP/"),
+            "unexpected response: {text:.100}"
+        );
+        eprintln!(
+            "smoke tcp ok: {} bytes, status: {}",
+            body.len(),
+            text.lines().next().unwrap_or("")
+        );
+    }
+
+    /// 错误密码必须被代理拒绝(RFC 1929 status 非 0)。
+    #[tokio::test]
+    #[ignore = "requires a real SOCKS5 proxy"]
+    async fn smoke_wrong_password_rejected() {
+        let Ok(proxy) = std::env::var("WTP_SMOKE_PROXY") else {
+            eprintln!("WTP_SMOKE_PROXY not set, skipping");
+            return;
+        };
+        let proxy = crate::config::SocksProxy::parse(&proxy).unwrap();
+        let (user, _) = proxy.auth().expect("smoke proxy must have credentials");
+        let err = timeout(
+            Duration::from_secs(10),
+            connect(
+                &proxy.addr,
+                Some((user, "wrong-password")),
+                "example.com",
+                80,
+            ),
+        )
+        .await
+        .expect("connect timed out")
+        .unwrap_err();
+        eprintln!("smoke wrong-password rejected as expected: {err}");
+    }
+
+    /// UDP ASSOCIATE 冒烟:经 relay 向 8.8.8.8:53 发 DNS A 查询并校验回包。
+    /// 顺带覆盖 `effective_relay`(不少服务端 BND.ADDR 回 0.0.0.0)。
+    #[tokio::test]
+    #[ignore = "requires a real SOCKS5 proxy"]
+    async fn smoke_udp_associate_with_auth() {
+        let Ok(proxy) = std::env::var("WTP_SMOKE_PROXY") else {
+            eprintln!("WTP_SMOKE_PROXY not set, skipping");
+            return;
+        };
+        let proxy = crate::config::SocksProxy::parse(&proxy).unwrap();
+        // control 连接必须活到 UDP 交换结束(服务端随 TCP 断开回收 relay)。
+        let (_control, relay) = timeout(
+            Duration::from_secs(10),
+            udp_associate(&proxy.addr, proxy.auth()),
+        )
+        .await
+        .expect("udp associate timed out")
+        .expect("UDP ASSOCIATE rejected; proxy may have UDP disabled (reply 0x07/0x09)");
+        let bind = if relay.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = tokio::net::UdpSocket::bind(bind).await.unwrap();
+
+        // DNS 查询 example.com 的 A 记录:id=0x1234, RD=1, QD=1。
+        let mut dns = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in ["example", "com"] {
+            dns.push(u8::try_from(label.len()).unwrap());
+            dns.extend_from_slice(label.as_bytes());
+        }
+        dns.extend_from_slice(&[0, 0, 1, 0, 1]); // 结束符 + QTYPE=A + QCLASS=IN
+
+        let mut packet = Vec::new();
+        encode_udp_packet(&mut packet, "8.8.8.8", 53, &dns).unwrap();
+        socket.send_to(&packet, relay).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = timeout(Duration::from_secs(10), socket.recv_from(&mut buf))
+            .await
+            .expect("dns reply timed out")
+            .unwrap();
+        let decoded = decode_udp_packet(&buf[..n]).unwrap();
+        let payload = &buf[decoded.payload_start..n];
+        assert!(payload.len() >= 12, "short DNS reply");
+        assert_eq!(&payload[..2], b"\x12\x34", "DNS id mismatch");
+        eprintln!(
+            "smoke udp ok: dns reply {} bytes via {relay}",
+            payload.len()
+        );
     }
 }
