@@ -9,6 +9,11 @@ pub struct Config {
     pub key: String,
     pub path: String,
     pub socks_proxy: Option<SocksProxy>,
+    /// 开启后,SOCKS5 服务端明确拒绝 UDP ASSOCIATE(回复码非 0,如 0x07/0x09)
+    /// 时,该 UDP 会话回落为直连。注意隐私含义:回落会话不走代理、目标域名
+    /// 由本地 DNS 解析、暴露本机真实出口 IP。缺省 false。
+    #[serde(default)]
+    pub socks_udp_fallback: bool,
     pub cwnd: Option<u64>,
 }
 
@@ -182,5 +187,38 @@ mod tests {
             socks_proxy = "user:pass:noport"
         "#;
         assert!(toml::from_str::<Config>(bad).is_err());
+    }
+
+    #[test]
+    fn udp_fallback_defaults_to_false() {
+        let minimal = r#"
+            listen = "127.0.0.1:443"
+            upstream = "http://127.0.0.1:80"
+            cert = "c.pem"
+            key = "k.pem"
+            path = "/"
+        "#;
+        assert!(
+            !toml::from_str::<Config>(minimal)
+                .unwrap()
+                .socks_udp_fallback
+        );
+    }
+
+    #[test]
+    fn udp_fallback_parses_true() {
+        let with_flag = r#"
+            listen = "127.0.0.1:443"
+            upstream = "http://127.0.0.1:80"
+            cert = "c.pem"
+            key = "k.pem"
+            path = "/"
+            socks_udp_fallback = true
+        "#;
+        assert!(
+            toml::from_str::<Config>(with_flag)
+                .unwrap()
+                .socks_udp_fallback
+        );
     }
 }

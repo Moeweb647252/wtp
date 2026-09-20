@@ -121,6 +121,20 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// SOCKS5 请求被服务端拒绝,携带回复码(0x07=command not supported 等)。
+/// 独立错误类型是为了让调用方(如 UDP fallback)能区分"服务端明确拒绝"
+/// 与连接/协议类错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyError(pub u8);
+
+impl std::fmt::Display for ReplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SOCKS5 request rejected: 0x{:02x}", self.0)
+    }
+}
+
+impl std::error::Error for ReplyError {}
+
 async fn request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     command: u8,
@@ -137,7 +151,7 @@ async fn request<S: AsyncRead + AsyncWrite + Unpin>(
         bail!("invalid SOCKS5 reply header");
     }
     if header[1] != 0 {
-        bail!("SOCKS5 request rejected: 0x{:02x}", header[1]);
+        return Err(ReplyError(header[1]).into());
     }
     read_socket_addr(stream, header[3]).await
 }
@@ -327,6 +341,28 @@ mod tests {
         );
         let explicit: SocketAddr = "198.51.100.7:9".parse().unwrap();
         assert_eq!(effective_relay(explicit, proxy), explicit);
+    }
+
+    /// 假代理回一条带非 0 回复码的回复,断言错误被分类为 `ReplyError` 且
+    /// `Display` 消息与改动前一致(UDP fallback 依赖这个 downcast)。
+    #[tokio::test]
+    async fn request_rejection_is_classified_as_reply_error() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            let mut req = [0u8; 10];
+            server.read_exact(&mut req).await.unwrap();
+            // 回复码 0x07 = command not supported;回复头 4 字节后即返回,无地址体。
+            server.write_all(&[VERSION, 7, 0, ATYP_IPV4]).await.unwrap();
+        });
+        let err = timeout(
+            Duration::from_secs(1),
+            request(&mut client, CMD_UDP_ASSOCIATE, "0.0.0.0", 0),
+        )
+        .await
+        .expect("request must not hang")
+        .unwrap_err();
+        assert_eq!(err.downcast_ref::<ReplyError>(), Some(&ReplyError(7)));
+        assert_eq!(err.to_string(), "SOCKS5 request rejected: 0x07");
     }
 
     #[tokio::test]

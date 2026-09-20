@@ -528,8 +528,21 @@ async fn handle_udp(
 ) -> anyhow::Result<()> {
     let mut tx = session.datagram_sender();
     let mut rx = session.datagram_reader();
-    if let Some(proxy) = config.socks_proxy.as_ref() {
-        let (mut control, relay_addr) = socks5::udp_associate(&proxy.addr, proxy.auth()).await?;
+    'proxied: {
+        let Some(proxy) = config.socks_proxy.as_ref() else {
+            break 'proxied;
+        };
+        // 只在服务端明确拒绝 UDP ASSOCIATE(回复码非 0,如 0x07/0x09)时按配置
+        // 回落;连不上、认证失败等不回落——避免代理宕机时静默直连。
+        let (mut control, relay_addr) = match socks5::udp_associate(&proxy.addr, proxy.auth()).await
+        {
+            Ok(ok) => ok,
+            Err(err) if config.socks_udp_fallback && err.is::<socks5::ReplyError>() => {
+                tracing::warn!("SOCKS5 UDP unavailable ({err}), falling back to direct UDP");
+                break 'proxied;
+            }
+            Err(err) => return Err(err),
+        };
         // relay 可能是 IPv6,本地 socket 必须绑定同族地址才能 send_to。
         let bind = if relay_addr.is_ipv6() {
             "[::]:0"
