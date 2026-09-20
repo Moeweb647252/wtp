@@ -52,7 +52,16 @@ fn effective_relay(relay: SocketAddr, proxy: SocketAddr) -> SocketAddr {
 }
 
 async fn connect_proxy(proxy: &str) -> Result<TcpStream> {
-    Ok(timeout(Duration::from_secs(10), TcpStream::connect(proxy)).await??)
+    let stream = timeout(Duration::from_secs(10), TcpStream::connect(proxy)).await??;
+    // UDP ASSOCIATE 的控制连接握手后全程无数据,靠 TCP keepalive 防服务端空闲
+    // 踢连;CONNECT 流顺带受益(能发现半开连接)。参数与 QUIC keepalive(60s)对齐。
+    // 注意 OS 默认 2 小时才发首个探测,必须显式调小才有意义。
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(60))
+        .with_retries(5);
+    socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive)?;
+    Ok(stream)
 }
 
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
@@ -318,6 +327,17 @@ mod tests {
         );
         let explicit: SocketAddr = "198.51.100.7:9".parse().unwrap();
         assert_eq!(effective_relay(explicit, proxy), explicit);
+    }
+
+    #[tokio::test]
+    async fn connect_proxy_enables_tcp_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = connect_proxy(&addr.to_string()).await.unwrap();
+        assert!(socket2::SockRef::from(&stream).keepalive().unwrap());
     }
 
     /// 假代理:校验客户端的方法协商字节,按参数回应;`auth_reply` 为 Some 时
